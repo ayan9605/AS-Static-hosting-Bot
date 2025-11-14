@@ -2,6 +2,8 @@ const { Telegraf, Markup } = require('telegraf');
 const LocalSession = require('telegraf-session-local');
 const axios = require('axios');
 const express = require('express');
+const fs = require('fs');
+const path = require('path');
 
 // Configuration
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
@@ -35,6 +37,45 @@ app.get('/health', (req, res) => {
 app.listen(PORT, () => {
   console.log(`🌐 Web server running on port ${PORT}`);
 });
+
+// User sites database with file persistence
+const USER_SITES_DB_PATH = path.join(__dirname, 'user_sites.json');
+
+let userSitesDB = {};
+if (fs.existsSync(USER_SITES_DB_PATH)) {
+  try {
+    userSitesDB = JSON.parse(fs.readFileSync(USER_SITES_DB_PATH, 'utf8'));
+  } catch (error) {
+    console.error('Error loading user sites database:', error);
+    userSitesDB = {};
+  }
+}
+
+// Helper: Save to file
+function saveToFile() {
+  try {
+    fs.writeFileSync(USER_SITES_DB_PATH, JSON.stringify(userSitesDB, null, 2));
+  } catch (error) {
+    console.error('Error saving user sites database:', error);
+  }
+}
+
+// Helper: Save user site
+function saveUserSite(userId, siteData) {
+  if (!userSitesDB[userId]) {
+    userSitesDB[userId] = [];
+  }
+  userSitesDB[userId].push({
+    ...siteData,
+    uploadedAt: new Date().toISOString()
+  });
+  saveToFile();
+}
+
+// Helper: Get user sites
+function getUserSites(userId) {
+  return userSitesDB[userId] || [];
+}
 
 // Helper: Check if user is admin
 function isAdmin(userId) {
@@ -77,6 +118,7 @@ async function uploadToHosting(siteName, files) {
 function mainMenu(isAdminUser = false) {
   const buttons = [
     [Markup.button.callback('🚀 Upload New Site', 'upload')],
+    [Markup.button.callback('📋 My Sites', 'my_sites')],
     [Markup.button.callback('📊 View Statistics', 'stats')],
     [Markup.button.callback('❓ Help', 'help')]
   ];
@@ -186,6 +228,60 @@ bot.action('stats', async (ctx) => {
   } catch (error) {
     const isAdminUser = isAdmin(ctx.from.id);
     ctx.editMessageText('❌ Failed to fetch statistics.\n\nPlease try again later.', mainMenu(isAdminUser));
+  }
+});
+
+// My Sites callback
+bot.action('my_sites', async (ctx) => {
+  try {
+    await ctx.answerCbQuery('Loading your sites...');
+    
+    const userId = ctx.from.id;
+    const userSites = getUserSites(userId);
+    
+    if (userSites.length === 0) {
+      return ctx.editMessageText(
+        '📋 *My Sites*\n\n' +
+        'You haven\'t uploaded any sites yet.\n\n' +
+        'Click "Upload New Site" to get started!',
+        {
+          parse_mode: 'Markdown',
+          ...mainMenu(isAdmin(userId))
+        }
+      );
+    }
+    
+    let message = `📋 *My Sites* (${userSites.length})\n\n`;
+    
+    userSites.forEach((site, index) => {
+      message += `${index + 1}. *${site.name}*\n`;
+      message += `   └ URL: ${site.url}\n`;
+      message += `   └ Slug: \`${site.slug}\`\n`;
+      message += `   └ Files: ${site.filesCount}\n`;
+      message += `   └ Uploaded: ${new Date(site.uploadedAt).toLocaleDateString()}\n\n`;
+    });
+    
+    // Create buttons for each site
+    const siteButtons = userSites.slice(0, 5).map((site) => 
+      [Markup.button.url(`🌐 View ${site.name}`, site.url)]
+    );
+    
+    if (userSites.length > 5) {
+      message += `_Showing first 5 sites. Total: ${userSites.length}_\n\n`;
+    }
+    
+    siteButtons.push([Markup.button.callback('🚀 Upload New Site', 'upload')]);
+    siteButtons.push([Markup.button.callback('🏠 Main Menu', 'back_menu')]);
+    
+    ctx.editMessageText(message, {
+      parse_mode: 'Markdown',
+      ...Markup.inlineKeyboard(siteButtons)
+    });
+    
+  } catch (error) {
+    console.error('My Sites error:', error);
+    const isAdminUser = isAdmin(ctx.from.id);
+    ctx.editMessageText('❌ Failed to load your sites.', mainMenu(isAdminUser));
   }
 });
 
@@ -404,6 +500,7 @@ bot.action('finish_upload', async (ctx) => {
   }
   
   const { siteName, files } = ctx.session;
+  const userId = ctx.from.id;
   
   try {
     await ctx.answerCbQuery('Deploying your site...');
@@ -412,6 +509,14 @@ bot.action('finish_upload', async (ctx) => {
     const result = await uploadToHosting(siteName, files);
     
     if (result.ok) {
+      // Save to user's sites list
+      saveUserSite(userId, {
+        name: siteName,
+        slug: result.slug,
+        url: result.url,
+        filesCount: files.length
+      });
+      
       const successMessage =
         '🎉 *Deployment Successful!*\n\n' +
         `🌐 Your site is live at:\n` +
@@ -424,6 +529,7 @@ bot.action('finish_upload', async (ctx) => {
         parse_mode: 'Markdown',
         ...Markup.inlineKeyboard([
           [Markup.button.url('🌐 View Site', result.url)],
+          [Markup.button.callback('📋 My Sites', 'my_sites')],
           [Markup.button.callback('🚀 Upload Another', 'upload')],
           [Markup.button.callback('🏠 Main Menu', 'back_menu')]
         ])
@@ -562,12 +668,21 @@ bot.on('document', async (ctx) => {
     
     if (ctx.session.uploadType === 'zip') {
       const { siteName, files } = ctx.session;
+      const userId = ctx.from.id;
       
       await ctx.reply('🚀 *Deploying your site...*\n\n⏳ Please wait...', { parse_mode: 'Markdown' });
       
       const result = await uploadToHosting(siteName, files);
       
       if (result.ok) {
+        // Save to user's sites list
+        saveUserSite(userId, {
+          name: siteName,
+          slug: result.slug,
+          url: result.url,
+          filesCount: files.length
+        });
+        
         const successMessage =
           '🎉 *Deployment Successful!*\n\n' +
           `🌐 Your site is live at:\n` +
@@ -579,6 +694,7 @@ bot.on('document', async (ctx) => {
           parse_mode: 'Markdown',
           ...Markup.inlineKeyboard([
             [Markup.button.url('🌐 View Site', result.url)],
+            [Markup.button.callback('📋 My Sites', 'my_sites')],
             [Markup.button.callback('🚀 Upload Another', 'upload')],
             [Markup.button.callback('🏠 Main Menu', 'back_menu')]
           ])
