@@ -2,16 +2,61 @@ const { Telegraf, Markup } = require('telegraf');
 const LocalSession = require('telegraf-session-local');
 const axios = require('axios');
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
+const mongoose = require('mongoose');
 
 // Configuration
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || 'YOUR_BOT_TOKEN_HERE';
 const API_URL = process.env.API_URL || 'https://as-static-hosting.onrender.com';
 const PORT = process.env.PORT || 3001;
+const MONGODB_URI = process.env.MONGODB_URI || 'mongodb+srv://username:password@cluster.mongodb.net/telegram-hosting?retryWrites=true&w=majority';
 
-// Admin user IDs (add your Telegram user ID here)
+// Admin user IDs
 const ADMIN_IDS = process.env.ADMIN_IDS ? process.env.ADMIN_IDS.split(',').map(id => parseInt(id)) : [];
+
+// MongoDB Connection
+mongoose.connect(MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+})
+.then(() => console.log('✅ Connected to MongoDB Atlas'))
+.catch((error) => console.error('❌ MongoDB connection error:', error));
+
+// MongoDB Schema for User Sites
+const userSiteSchema = new mongoose.Schema({
+  userId: {
+    type: Number,
+    required: true,
+    index: true
+  },
+  name: {
+    type: String,
+    required: true
+  },
+  slug: {
+    type: String,
+    required: true,
+    unique: true
+  },
+  url: {
+    type: String,
+    required: true
+  },
+  filesCount: {
+    type: Number,
+    default: 0
+  },
+  uploadedAt: {
+    type: Date,
+    default: Date.now
+  },
+  status: {
+    type: String,
+    enum: ['active', 'deleted'],
+    default: 'active'
+  }
+});
+
+const UserSite = mongoose.model('UserSite', userSiteSchema);
 
 const bot = new Telegraf(BOT_TOKEN);
 
@@ -26,55 +71,102 @@ app.get('/', (req, res) => {
     status: 'ok', 
     service: 'Static Site Hosting Bot',
     uptime: process.uptime(),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
   });
 });
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', bot: 'running' });
+  res.json({ 
+    status: 'ok', 
+    bot: 'running',
+    database: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected'
+  });
 });
 
 app.listen(PORT, () => {
   console.log(`🌐 Web server running on port ${PORT}`);
 });
 
-// User sites database with file persistence
-const USER_SITES_DB_PATH = path.join(__dirname, 'user_sites.json');
-
-let userSitesDB = {};
-if (fs.existsSync(USER_SITES_DB_PATH)) {
+// Helper: Save user site to MongoDB
+async function saveUserSite(userId, siteData) {
   try {
-    userSitesDB = JSON.parse(fs.readFileSync(USER_SITES_DB_PATH, 'utf8'));
+    const newSite = new UserSite({
+      userId,
+      ...siteData,
+      uploadedAt: new Date()
+    });
+    await newSite.save();
+    console.log(`✅ Saved site "${siteData.name}" for user ${userId}`);
   } catch (error) {
-    console.error('Error loading user sites database:', error);
-    userSitesDB = {};
+    console.error('Error saving user site:', error);
+    throw error;
   }
 }
 
-// Helper: Save to file
-function saveToFile() {
+// Helper: Get user sites from MongoDB
+async function getUserSites(userId) {
   try {
-    fs.writeFileSync(USER_SITES_DB_PATH, JSON.stringify(userSitesDB, null, 2));
+    const sites = await UserSite.find({ 
+      userId, 
+      status: 'active' 
+    }).sort({ uploadedAt: -1 });
+    return sites;
   } catch (error) {
-    console.error('Error saving user sites database:', error);
+    console.error('Error fetching user sites:', error);
+    return [];
   }
 }
 
-// Helper: Save user site
-function saveUserSite(userId, siteData) {
-  if (!userSitesDB[userId]) {
-    userSitesDB[userId] = [];
+// Helper: Get all sites (admin)
+async function getAllSites() {
+  try {
+    const sites = await UserSite.find().sort({ uploadedAt: -1 });
+    return sites;
+  } catch (error) {
+    console.error('Error fetching all sites:', error);
+    return [];
   }
-  userSitesDB[userId].push({
-    ...siteData,
-    uploadedAt: new Date().toISOString()
-  });
-  saveToFile();
 }
 
-// Helper: Get user sites
-function getUserSites(userId) {
-  return userSitesDB[userId] || [];
+// Helper: Delete site by slug
+async function deleteSiteBySlug(slug) {
+  try {
+    const result = await UserSite.findOneAndUpdate(
+      { slug },
+      { status: 'deleted' },
+      { new: true }
+    );
+    return result !== null;
+  } catch (error) {
+    console.error('Error deleting site:', error);
+    return false;
+  }
+}
+
+// Helper: Restore site by slug
+async function restoreSiteBySlug(slug) {
+  try {
+    const result = await UserSite.findOneAndUpdate(
+      { slug },
+      { status: 'active' },
+      { new: true }
+    );
+    return result !== null;
+  } catch (error) {
+    console.error('Error restoring site:', error);
+    return false;
+  }
+}
+
+// Helper: Get total sites count
+async function getTotalSitesCount() {
+  try {
+    return await UserSite.countDocuments({ status: 'active' });
+  } catch (error) {
+    console.error('Error counting sites:', error);
+    return 0;
+  }
 }
 
 // Helper: Check if user is admin
@@ -210,13 +302,18 @@ bot.action('stats', async (ctx) => {
   try {
     await ctx.answerCbQuery('Fetching statistics...');
     
-    const response = await axios.get(`${API_URL}/api/admin/usage`);
-    const stats = response.data;
+    const [apiStats, totalSites] = await Promise.all([
+      axios.get(`${API_URL}/api/admin/usage`).catch(() => null),
+      getTotalSitesCount()
+    ]);
+    
+    const stats = apiStats?.data || {};
     
     const statsText =
       '📊 *Hosting Statistics*\n\n' +
-      `🌐 Total Sites: *${stats.totalSites}*\n` +
-      `💾 Storage Used: *${stats.totalStorageFormatted}*\n` +
+      `🌐 Total Sites: *${stats.totalSites || totalSites}*\n` +
+      `💾 Storage Used: *${stats.totalStorageFormatted || 'N/A'}*\n` +
+      `📊 Database: *MongoDB Atlas*\n` +
       `✅ Status: *Active*\n\n` +
       `API: \`${API_URL}\``;
     
@@ -237,7 +334,7 @@ bot.action('my_sites', async (ctx) => {
     await ctx.answerCbQuery('Loading your sites...');
     
     const userId = ctx.from.id;
-    const userSites = getUserSites(userId);
+    const userSites = await getUserSites(userId);
     
     if (userSites.length === 0) {
       return ctx.editMessageText(
@@ -310,8 +407,7 @@ bot.action('admin_list_sites', async (ctx) => {
   try {
     await ctx.answerCbQuery('Fetching sites...');
     
-    const response = await axios.get(`${API_URL}/api/admin/sites`);
-    const sites = response.data.sites;
+    const sites = await getAllSites();
     
     if (sites.length === 0) {
       return ctx.editMessageText('📋 *All Sites*\n\nNo sites found.', {
@@ -323,10 +419,11 @@ bot.action('admin_list_sites', async (ctx) => {
     let message = '📋 *All Sites*\n\n';
     sites.slice(0, 10).forEach((site, index) => {
       message += `${index + 1}. *${site.name}*\n`;
+      message += `   └ User ID: ${site.userId}\n`;
       message += `   └ Slug: \`${site.slug}\`\n`;
-      message += `   └ Size: ${(site.size_bytes / 1024).toFixed(2)} KB\n`;
+      message += `   └ Files: ${site.filesCount}\n`;
       message += `   └ Status: ${site.status}\n`;
-      message += `   └ Created: ${new Date(site.created_at).toLocaleDateString()}\n\n`;
+      message += `   └ Created: ${new Date(site.uploadedAt).toLocaleDateString()}\n\n`;
     });
     
     if (sites.length > 10) {
@@ -351,22 +448,22 @@ bot.action('admin_server_stats', async (ctx) => {
   try {
     await ctx.answerCbQuery('Fetching stats...');
     
-    const [usage, health] = await Promise.all([
-      axios.get(`${API_URL}/api/admin/usage`),
-      axios.get(`${API_URL}/health`)
+    const [usage, health, totalSites] = await Promise.all([
+      axios.get(`${API_URL}/api/admin/usage`).catch(() => null),
+      axios.get(`${API_URL}/health`).catch(() => null),
+      getTotalSitesCount()
     ]);
     
-    const stats = usage.data;
-    const healthData = health.data;
+    const stats = usage?.data || {};
+    const healthData = health?.data || {};
     
     const message =
       '📊 *Server Statistics*\n\n' +
-      `🌐 Total Sites: *${stats.totalSites}*\n` +
-      `💾 Storage: *${stats.totalStorageFormatted}*\n` +
-      `⏱️ Uptime: *${healthData.uptime}*\n` +
-      `🖥️ Platform: *${healthData.server?.platform || 'N/A'}*\n` +
-      `📈 Memory: *${healthData.server?.memory?.used || 'N/A'}*\n` +
-      `✅ Status: *${healthData.status}*\n\n` +
+      `🌐 Total Sites: *${stats.totalSites || totalSites}*\n` +
+      `💾 Storage: *${stats.totalStorageFormatted || 'N/A'}*\n` +
+      `📊 Database: *MongoDB Atlas (${mongoose.connection.readyState === 1 ? 'Connected' : 'Disconnected'})*\n` +
+      `⏱️ Uptime: *${Math.floor(process.uptime() / 60)} minutes*\n` +
+      `✅ Status: *${healthData.status || 'Active'}*\n\n` +
       `🔗 API: \`${API_URL}\``;
     
     ctx.editMessageText(message, {
@@ -509,8 +606,8 @@ bot.action('finish_upload', async (ctx) => {
     const result = await uploadToHosting(siteName, files);
     
     if (result.ok) {
-      // Save to user's sites list
-      saveUserSite(userId, {
+      // Save to MongoDB
+      await saveUserSite(userId, {
         name: siteName,
         slug: result.slug,
         url: result.url,
@@ -565,12 +662,17 @@ bot.on('text', async (ctx) => {
     const slug = ctx.message.text.trim();
     try {
       await ctx.reply('🗑️ Deleting site...');
-      const response = await axios.post(`${API_URL}/api/admin/site/${slug}/delete`);
       
-      if (response.data.ok) {
+      // Delete from MongoDB
+      const deleted = await deleteSiteBySlug(slug);
+      
+      // Also try deleting from API
+      const apiResponse = await axios.post(`${API_URL}/api/admin/site/${slug}/delete`).catch(() => null);
+      
+      if (deleted || apiResponse?.data?.ok) {
         ctx.reply(`✅ Site "${slug}" deleted successfully!`, adminMenu());
       } else {
-        ctx.reply(`❌ Failed: ${response.data.error}`, adminMenu());
+        ctx.reply(`❌ Site "${slug}" not found.`, adminMenu());
       }
     } catch (error) {
       ctx.reply('❌ Failed to delete site.', adminMenu());
@@ -586,12 +688,17 @@ bot.on('text', async (ctx) => {
     const slug = ctx.message.text.trim();
     try {
       await ctx.reply('♻️ Restoring site...');
-      const response = await axios.post(`${API_URL}/api/admin/site/${slug}/restore`);
       
-      if (response.data.ok) {
+      // Restore in MongoDB
+      const restored = await restoreSiteBySlug(slug);
+      
+      // Also try restoring via API
+      const apiResponse = await axios.post(`${API_URL}/api/admin/site/${slug}/restore`).catch(() => null);
+      
+      if (restored || apiResponse?.data?.ok) {
         ctx.reply(`✅ Site "${slug}" restored successfully!`, adminMenu());
       } else {
-        ctx.reply(`❌ Failed: ${response.data.error}`, adminMenu());
+        ctx.reply(`❌ Site "${slug}" not found.`, adminMenu());
       }
     } catch (error) {
       ctx.reply('❌ Failed to restore site.', adminMenu());
@@ -675,8 +782,8 @@ bot.on('document', async (ctx) => {
       const result = await uploadToHosting(siteName, files);
       
       if (result.ok) {
-        // Save to user's sites list
-        saveUserSite(userId, {
+        // Save to MongoDB
+        await saveUserSite(userId, {
           name: siteName,
           slug: result.slug,
           url: result.url,
@@ -739,8 +846,15 @@ bot.launch();
 
 console.log('🤖 Telegram bot started!');
 console.log('API URL:', API_URL);
+console.log('MongoDB:', mongoose.connection.readyState === 1 ? 'Connected' : 'Connecting...');
 console.log('Admin IDs:', ADMIN_IDS.length > 0 ? ADMIN_IDS.join(', ') : 'None set');
 
 // Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => {
+  bot.stop('SIGINT');
+  mongoose.connection.close();
+});
+process.once('SIGTERM', () => {
+  bot.stop('SIGTERM');
+  mongoose.connection.close();
+});
